@@ -5,6 +5,7 @@ import librosa
 import torch
 import torch.nn.functional as F
 import torchaudio
+import time, os, requests, threading # wav2ip
 from coqpit import Coqpit
 
 from TTS.tts.layers.xtts.gpt import GPT
@@ -18,6 +19,29 @@ from TTS.utils.io import load_fsspec
 init_stream_support()
 
 
+# reads file, it doesn't rewrite it anymore
+# @filename: full path to file
+# returns: 0 - stop, 1 - play allowed
+def xtts_play_allowed_check(filename="xtts_play_allowed.txt"):
+    #Check if 'xtts_play_allowed.txt' contains '0', stop streaming.
+    value = None
+    try:
+        if not os.path.isfile(filename):
+            print("check_for_stop: File "+filename+" does not exist.")
+
+        else:
+            with open(filename, 'r') as fp:
+                value = int(fp.read().strip())     # Read the entire file and remove leading/trailing whitespace characters                
+            if value == 0:                         # If the file contains '0'
+                #with open(filename, 'w+') as fp:   # Reopen the file in writing mode ('w+')
+                #    fp.write('1\n')                # Reset the file contents to '1' (allowed)
+                print("Stream stopped successfully!")
+                return 0
+    except Exception as e:
+        print(f"An error occurred: {e}")            
+        return 0
+        
+    return 1
 def wav_to_mel_cloning(
     wav,
     mel_norms_file="../experiments/clips_mel_norms.pth",
@@ -187,6 +211,9 @@ class XttsArgs(Coqpit):
     # constants
     duration_const: int = 102400
 
+    # wav2lip
+    wav_number: int = 1
+    wav_number_in_request: int = 0                                 
 
 class Xtts(BaseTTS):
     """ⓍTTS model implementation.
@@ -518,15 +545,43 @@ class Xtts(BaseTTS):
         enable_text_splitting=False,
         **hf_generate_kwargs,
     ):
+        
+        
+        xtts_play_allowed_path = os.path.join(os.getenv("BAT_DIR"), "xtts_play_allowed.txt")
+        
+        OUTPUT_FOLDER = os.getenv('OUTPUT', 'output')
+        CALL_WAV2LIP = os.getenv("CALL_WAV2LIP") == 'true'
+        STREAM_TO_WAVS = os.getenv('STREAM_TO_WAVS') == 'true'
+        REPLY_PART = os.getenv('REPLY_PART')
+        SPEAKER_NAME = os.getenv('SPEAKER_NAME')
+        tokens_in_steps_arg = [int(token.strip()) for token in os.getenv('WAV_CHUNK_SIZES').split(',')]
+        
+        if (REPLY_PART is not None):
+            REPLY_PART = int(REPLY_PART)
+        else:
+            REPLY_PART = 0
+        if (SPEAKER_NAME is None):
+            SPEAKER_NAME = "default"    
+        #print(str(time.time())+" in xtts inference, REPLY_PART: "+str(REPLY_PART))
+        
+        if (STREAM_TO_WAVS):                
+            if (text == "x_warmup"):                                  
+                tokens_in_steps = [5]
+            else:    
+                tokens_in_steps = tokens_in_steps_arg #[10, 20, 40, 100, 200, 300, 400, 9999]
+        else:
+            tokens_in_steps = [9999]
+                
+        return_dict_in_generate = True
         language = language.split("-")[0]  # remove the country code
         length_scale = 1.0 / max(speed, 0.05)
-        gpt_cond_latent = gpt_cond_latent.to(self.device)
-        speaker_embedding = speaker_embedding.to(self.device)
+        gpt_cond_latent = gpt_cond_latent.to(self.device) # new, untested
+        speaker_embedding = speaker_embedding.to(self.device) # new, untested                                                    
         if enable_text_splitting:
-            text = split_sentence(text, language, self.tokenizer.char_limits[language])
+            text = split_sentence(text, language, self.tokenizer.char_limits[language]) # 250 chars for en
         else:
             text = [text]
-
+            
         wavs = []
         gpt_latents_list = []
         for sent in text:
@@ -535,52 +590,162 @@ class Xtts(BaseTTS):
 
             assert (
                 text_tokens.shape[-1] < self.args.gpt_max_text_tokens
-            ), " ❗ XTTS can only generate text with a maximum of 400 tokens."
+            ), " ❗ XTTS can only generate text with a maximum of 400 tokens."   
+            
+            step_c = 0
+            tokens_generated_prev_sum = 0
+            
+            
+            # STEPS
+            while step_c < len(tokens_in_steps):
+                
+                xtts_play_allowed = xtts_play_allowed_check(xtts_play_allowed_path)
+                if (xtts_play_allowed == 0):
+                    print("speech detected, xtts won't generate")
+                    #return 0
+                    return {
+                        "wav": torch.cat(wavs, dim=0).numpy(),
+                        "gpt_latents": torch.cat(gpt_latents_list, dim=1).numpy(),
+                        "speaker_embedding": speaker_embedding,
+                    }
+                
+                if (step_c == 0):
+                    tokens_in_prev_steps = 0
+                    input_tokens = None
+                    attention_mask = None
+                else:
+                    tokens_in_prev_steps += tokens_in_this_step
+                    input_tokens=gpt_codes_full
+                    attention_mask = None
+                    #attention_mask = torch.ones(1, len(gen[0][0])+len(text_tokens[0])+len(gpt_cond_latent[0])+3, dtype=torch.int64, device=self.device) 
+                
+                tokens_in_this_step = tokens_in_steps[step_c]                
+                wavs = []
+                
+                # one STEP 
+                with torch.no_grad():                    
+                    # predict tokens
+                    #print(str(time.time())+" bef gpt_codes for: "+sent+". STEP "+str(step_c))
+                    gen = self.gpt.generate(
+                        cond_latents=gpt_cond_latent,
+                        text_inputs=text_tokens,
+                        input_tokens=input_tokens,
+                        do_sample=do_sample,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        num_return_sequences=self.gpt_batch_size,
+                        num_beams=num_beams,
+                        length_penalty=length_penalty,
+                        repetition_penalty=repetition_penalty,
+                        output_attentions=False,                    
+                        output_hidden_states=False,   
+                        return_dict_in_generate=return_dict_in_generate,
+                        max_gen_mel_tokens=tokens_in_this_step, # 10 for first
+                        past_mels=tokens_in_prev_steps,
+                        position_ids=None,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                        **hf_generate_kwargs,
+                    )
+                    if (sent == "x_warmup"):
+                        return 0
+                    
+                    if (return_dict_in_generate):
+                        gpt_codes = gen[0]
+                    else:
+                        gpt_codes = gen
+                    if (step_c):
+                        gpt_codes_full = torch.cat((gpt_codes_full, gpt_codes), dim=1)
+                    else:
+                        gpt_codes_full = gpt_codes
+                        
+                    #print(str(time.time())+" after gpt_codes. max-mels: "+str(tokens_in_this_step)+", gpt len: "+str(gpt_codes.shape[-1])+", text tok len: "+str(text_tokens.shape[-1]))
+                    expected_output_len = torch.tensor(
+                        [gpt_codes_full.shape[-1] * self.gpt.code_stride_len], device=text_tokens.device
+                    )
+                    
+                    text_len = torch.tensor([text_tokens.shape[-1]], device=self.device)    
+                    
+                    # tokens to latents
+                    # TODO pass only last gpt_codes and trim text_tokens, currently they cause bad audio connections with hallucinations
+                    gpt_latents = self.gpt(
+                        text_tokens, 
+                        text_len,
+                        gpt_codes_full, #gpt_codes
+                        expected_output_len,
+                        cond_latents=gpt_cond_latent,
+                        return_attentions=False,
+                        return_latent=True,
+                    )
+                    #print(str(time.time())+" after gpt_latents len: "+str(len(gpt_latents[0])))
+                    if (tokens_generated_prev_sum):
+                        new_latents_n = len(gpt_latents[0]) - tokens_generated_prev_sum
+                        gpt_latents = gpt_latents[:, -new_latents_n:]
+                        #print("trimmed gpt_latents, new len: "+str(len(gpt_latents[0])))
+                    
+                    if length_scale != 1.0:
+                        gpt_latents = F.interpolate(
+                            gpt_latents.transpose(1, 2), scale_factor=length_scale, mode="linear"
+                        ).transpose(1, 2)
 
-            with torch.no_grad():
-                gpt_codes = self.gpt.generate(
-                    cond_latents=gpt_cond_latent,
-                    text_inputs=text_tokens,
-                    input_tokens=None,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                    top_k=top_k,
-                    temperature=temperature,
-                    num_return_sequences=self.gpt_batch_size,
-                    num_beams=num_beams,
-                    length_penalty=length_penalty,
-                    repetition_penalty=repetition_penalty,
-                    output_attentions=False,
-                    **hf_generate_kwargs,
-                )
-                expected_output_len = torch.tensor(
-                    [gpt_codes.shape[-1] * self.gpt.code_stride_len], device=text_tokens.device
-                )
+                    gpt_latents_list.append(gpt_latents.cpu())
+                    wavs.append(self.hifigan_decoder(gpt_latents, g=speaker_embedding).cpu().squeeze())
+                    
+                    if (STREAM_TO_WAVS or CALL_WAV2LIP):
+                        wav_tensor = torch.cat(wavs, dim=0).numpy()
+                        output_file = OUTPUT_FOLDER+"out_"+str(self.wav_number)+".wav"                   
+                        torchaudio.save(output_file, torch.tensor(wav_tensor).unsqueeze(0), 24000, encoding="PCM_U")
+                        print(str(time.time())+" SAVED "+str(self.wav_number)+" audio to "+output_file)
+                    
+                    if (CALL_WAV2LIP):
+                        #wav2lip async http call
+                        #print(str(time.time())+' sending '+SPEAKER_NAME+' '+str(self.wav_number_in_request)+' audio, wav gpt tokens: '+str(str(gpt_codes.shape[-1]))+', wav_number_'+str(self.wav_number)+'_'+str(REPLY_PART)+' to wav2lip')
+                        thr = threading.Thread(target=self.call_wav2ip, args=[self.wav_number, REPLY_PART, SPEAKER_NAME], kwargs={})
+                        REPLY_PART += 1
+                        self.wav_number+=1
+                        self.wav_number_in_request += 1
+                        thr.start()        
+                        #wav2lip
+                        
+                    tokens_generated_prev_sum += gpt_codes.shape[-1]
+                    
+                    if (gen[0][0][-1] == 1025): # pad_token (end)  
+                        break
+                    
+                #print(str(time.time())+" after cycle STEP "+str(step_c)) 
+                step_c += 1
 
-                text_len = torch.tensor([text_tokens.shape[-1]], device=self.device)
-                gpt_latents = self.gpt(
-                    text_tokens,
-                    text_len,
-                    gpt_codes,
-                    expected_output_len,
-                    cond_latents=gpt_cond_latent,
-                    return_attentions=False,
-                    return_latent=True,
-                )
-
-                if length_scale != 1.0:
-                    gpt_latents = F.interpolate(
-                        gpt_latents.transpose(1, 2), scale_factor=length_scale, mode="linear"
-                    ).transpose(1, 2)
-
-                gpt_latents_list.append(gpt_latents.cpu())
-                wavs.append(self.hifigan_decoder(gpt_latents, g=speaker_embedding).cpu().squeeze())
-
+        # TODO: move it somewhere else, it's blocking
+        #thr.join() # cleaning all curl threads
+        #print(str(time.time())+" joining threads done") 
+        
         return {
             "wav": torch.cat(wavs, dim=0).numpy(),
             "gpt_latents": torch.cat(gpt_latents_list, dim=1).numpy(),
             "speaker_embedding": speaker_embedding,
         }
+
+    def call_wav2ip(self, wav_number, reply_part=0, speaker_name="default"):
+        OUTPUT_FOLDER = os.getenv('OUTPUT', 'output')
+        EXTRAS_URL = os.getenv('EXTRAS_URL')
+        """
+        call wav2ip using curl
+        TODO: clean old wavs
+        """
+        wav_name = 'out_'+str(wav_number)
+        wav_filename = wav_name+'.wav'
+        #print(str(time.time())+' in call_wav2ip: '+str(wav_number)+'_'+str(reply_part)+' wav')
+        if (os.path.isfile(OUTPUT_FOLDER+wav_filename)):
+            url = EXTRAS_URL+'api/wav2lip/generate/'+speaker_name+'/cuda/'+wav_name+'/latest/'+str(wav_number)+'/'+str(reply_part)
+            response = requests.get(url)
+            if response.status_code == 200:                            
+                print(str(time.time())+' wav2ip resp '+str(wav_number)+' OK')               
+            else:
+                print("Request failed with status code", response.status_code)
+        else:
+            print("call_wav2ip error: "+wav_filename+" is not found")
+            #wav2lip
 
     def handle_chunks(self, wav_gen, wav_gen_prev, wav_overlap, overlap_len):
         """Handle chunk formatting in streaming mode"""

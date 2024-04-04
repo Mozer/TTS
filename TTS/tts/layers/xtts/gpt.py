@@ -3,6 +3,7 @@
 import functools
 import math
 import random
+import time
 
 import torch
 import torch.nn as nn
@@ -584,19 +585,64 @@ class GPT(nn.Module):
         self,
         cond_latents,
         text_inputs,
+        max_gen_mel_tokens=0,
+        past_mels=0,
+        position_ids=None,
         **hf_generate_kwargs,
     ):
-        gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
+        if (not max_gen_mel_tokens):
+            max_gen_mel_tokens = self.max_gen_mel_tokens
+        #print(" -> in gpt generate, max_gen_mel_tokens: "+str(max_gen_mel_tokens)+"  ")    
+        
+        # for 2nd pass
+        if (hf_generate_kwargs["input_tokens"] is not None):
+            '''
+            print("generate 2nd pass found")
+            print("text_inputs:")
+            print(text_inputs)
+            print("hf_generate_kwargs[input_tokens]:")
+            print(hf_generate_kwargs["input_tokens"])
+            print("compute_embeddings")
+            print(self.compute_embeddings(cond_latents, text_inputs))
+            '''
+            gpt_inputs = torch.hstack((self.compute_embeddings(cond_latents, text_inputs), hf_generate_kwargs["input_tokens"]))
+            #hf_generate_kwargs["attention_mask"]=torch.ones(1, len(gen[0][0])+45, dtype=torch.int64, device=self.device),
+            del hf_generate_kwargs['input_tokens']
+            #max_length = max_gen_mel_tokens + self.compute_embeddings(cond_latents, text_inputs).shape[-1] - past_mels
+        else:    
+            # 1st pass
+            gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
+        max_length = max_gen_mel_tokens + gpt_inputs.shape[-1]# - past_mels
+
+        #print(max_length)  #  [[1, 1, ... 1, 1024]]
+        #print(gpt_inputs)  #  [[1, 1, ... 1, 1024]]
+        #print(hf_generate_kwargs)  # {'input_tokens': None, 'do_sample': True, 'top_p': 0.85, 'top_k': 50, 'temperature': 0.75, 'num_return_sequences': 1, 'num_beams': 1, 'length_penalty': 1.0, 'repetition_penalty': 5.0, 'output_attentions': False}
+        
+        # https://huggingface.co/docs/transformers/v4.39.1/en/model_doc/gpt2#transformers.GPT2Model.forward
+        # https://github.com/huggingface/transformers/issues/18104
         gen = self.gpt_inference.generate(
             gpt_inputs,
             bos_token_id=self.start_audio_token,
             pad_token_id=self.stop_audio_token,
             eos_token_id=self.stop_audio_token,
-            max_length=self.max_gen_mel_tokens + gpt_inputs.shape[-1],
+            max_length=max_length,
+            position_ids=position_ids,
             **hf_generate_kwargs,
         )
+        '''
+        [[   1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
+            1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
+            1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
+            1,    1,    1,    1,    1,    1,    1,    1, 1024,   70,  239,   61,
+          339,   28,   22,  296,  405,  369,  613,  392,  401,   20,  268,  493,
+          144,  270,  325,  368,  343,  466,  422,  323,   53,   11,  598,  527,
+          225,  279,  807,  154,  640,   74,  481,   59,   47,  203,  469,   85,
+          290,   68,   50,  611,  406,  217,  855, 1012, 1025]]
+        '''
+        #print(gen)
         if "return_dict_in_generate" in hf_generate_kwargs:
             return gen.sequences[:, gpt_inputs.shape[1] :], gen
+            #return gen.sequences[:, gpt_inputs.shape[1] :]
         return gen[:, gpt_inputs.shape[1] :]
 
     def get_generator(self, fake_inputs, **hf_generate_kwargs):
