@@ -1,3 +1,7 @@
+### This is part of talk-llama-fast. Don't use installation guide at current page here, it is outdated and left for legacy. Full and actual instruction how to install is here: https://github.com/Mozer/talk-llama-fast
+
+Old and original readme:
+
 
 ## 🐸Coqui.ai News
 - 📣 ⓍTTSv2 is here with 16 languages and better performance across the board.
