@@ -241,6 +241,8 @@ class Xtts(BaseTTS):
         self.gpt = None
         self.init_models()
         self.register_buffer("mel_stats", torch.ones(80))
+        self.wav_number = 1
+        self.wav_number_in_request = 0
 
     def init_models(self):
         """Initialize the models. We do it here since we need to load the tokenizer first."""
@@ -698,7 +700,7 @@ class Xtts(BaseTTS):
                         torchaudio.save(output_file, torch.tensor(wav_tensor).unsqueeze(0), 24000, encoding="PCM_U")
                         print(str(time.time())+" SAVED "+str(self.wav_number)+" audio to "+output_file)
                     
-                    if (CALL_WAV2LIP):
+                    if (CALL_WAV2LIP):                        
                         #wav2lip async http call
                         #print(str(time.time())+' sending '+SPEAKER_NAME+' '+str(self.wav_number_in_request)+' audio, wav gpt tokens: '+str(str(gpt_codes.shape[-1]))+', wav_number_'+str(self.wav_number)+'_'+str(REPLY_PART)+' to wav2lip')
                         thr = threading.Thread(target=self.call_wav2ip, args=[self.wav_number, REPLY_PART, SPEAKER_NAME], kwargs={})
