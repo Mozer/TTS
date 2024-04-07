@@ -5,7 +5,7 @@ import librosa
 import torch
 import torch.nn.functional as F
 import torchaudio
-import time, os, requests, threading # wav2ip
+import time, os, requests, threading, tempfile # wav2ip
 from coqpit import Coqpit
 
 from TTS.tts.layers.xtts.gpt import GPT
@@ -19,29 +19,30 @@ from TTS.utils.io import load_fsspec
 init_stream_support()
 
 
-# reads file, it doesn't rewrite it anymore
-# @filename: full path to file
-# returns: 0 - stop, 1 - play allowed
-def xtts_play_allowed_check(filename="xtts_play_allowed.txt"):
-    #Check if 'xtts_play_allowed.txt' contains '0', stop streaming.
-    value = None
+def get_shared_temp_value():
+    file_path = os.path.join(tempfile.gettempdir(), "xtts_play_allowed.txt")
     try:
-        if not os.path.isfile(filename):
-            print("check_for_stop: File "+filename+" does not exist.")
-
-        else:
-            with open(filename, 'r') as fp:
-                value = int(fp.read().strip())     # Read the entire file and remove leading/trailing whitespace characters                
-            if value == 0:                         # If the file contains '0'
-                #with open(filename, 'w+') as fp:   # Reopen the file in writing mode ('w+')
-                #    fp.write('1\n')                # Reset the file contents to '1' (allowed)
-                print("Stream stopped successfully!")
-                return 0
-    except Exception as e:
-        print(f"An error occurred: {e}")            
-        return 0
-        
-    return 1
+        with open(file_path, "r") as file:
+            value = file.read().strip()
+        return value
+    except IOError:
+        print(f"Error reading from file: {file_path}")
+        return None
+    
+# NEW, temp/xtts_play_allowed.txt for '0' or '1'
+# @filename: not used, we store file in /temp
+# returns: int 0 - stop, 1 - play allowed
+def xtts_play_allowed_check():
+    #Check if var contains '0', stop streaming.
+    value = get_shared_temp_value()
+    if (value is None): # var not set
+        value = 1        
+    else:
+        value = int(value)        
+    
+    return value  
+    
+    
 def wav_to_mel_cloning(
     wav,
     mel_norms_file="../experiments/clips_mel_norms.pth",
@@ -549,8 +550,6 @@ class Xtts(BaseTTS):
     ):
         
         
-        xtts_play_allowed_path = os.path.join(os.getenv("BAT_DIR"), "xtts_play_allowed.txt")
-        
         OUTPUT_FOLDER = os.getenv('OUTPUT', 'output')
         CALL_WAV2LIP = os.getenv("CALL_WAV2LIP") == 'true'
         STREAM_TO_WAVS = os.getenv('STREAM_TO_WAVS') == 'true'
@@ -601,7 +600,7 @@ class Xtts(BaseTTS):
             # STEPS
             while step_c < len(tokens_in_steps):
                 
-                xtts_play_allowed = xtts_play_allowed_check(xtts_play_allowed_path)
+                xtts_play_allowed = xtts_play_allowed_check()
                 if (xtts_play_allowed == 0):
                     print("speech detected, xtts won't generate")
                     #return 0
